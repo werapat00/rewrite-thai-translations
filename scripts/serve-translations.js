@@ -149,7 +149,8 @@ function escapeQuoted(s) {
 function buildPatchLine(originalRawLine, newText) {
   const quoteIndex = originalRawLine.indexOf('"');
   const prefix = quoteIndex === -1 ? "" : originalRawLine.slice(0, quoteIndex);
-  return `${prefix}"${escapeQuoted(newText)}"R`;
+  const tail = matchTrailingComment(originalRawLine.trim()) ?? "";
+  return `${prefix}"${escapeQuoted(newText)}"R${tail}`;
 }
 
 // Rebuilds a `#NAMAE = "key", "DisplayName", ...` gameexe.ini line with an
@@ -187,14 +188,204 @@ function readLines(filePath) {
   return text.split("\r\n");
 }
 
-// Dialogue/narration lines in this engine's .ss format end with `"R`.
-// Comment lines (`;` or `//`) can coincidentally end the same way, so
+// Some text lines carry a trailing dev comment after the `"R` marker, e.g.:
+//   "I bow like the obedient servant of a noble house."R	// Rewrite+ 変更
+// Finds the closing `"R` of the line's last quoted segment and returns
+// whatever follows it (empty string, or the trailing comment including its
+// leading whitespace), or null if the line doesn't end in `"R` at all.
+function matchTrailingComment(trimmed) {
+  const quoteRe = /"((?:[^"\\]|\\.)*)"/g;
+  let lastEnd = -1;
+  while (quoteRe.exec(trimmed)) {
+    lastEnd = quoteRe.lastIndex;
+  }
+  if (lastEnd === -1 || trimmed[lastEnd] !== "R") return null;
+  const tail = trimmed.slice(lastEnd + 1);
+  if (tail === "" || /^\s*(\/\/|;)/.test(tail)) return tail;
+  return null;
+}
+
+// Dialogue/narration lines in this engine's .ss format end with `"R`,
+// optionally followed by a trailing `//` or `;` dev comment. Comment-only
+// lines (`;` or `//` at the start) can coincidentally end the same way, so
 // they're excluded even though they end with the marker.
 function isTextLine(line) {
   const trimmed = line.trim();
   if (!trimmed) return false;
   if (trimmed.startsWith(";") || trimmed.startsWith("//")) return false;
-  return trimmed.endsWith('"R');
+  return matchTrailingComment(trimmed) !== null;
+}
+
+// Recognizes the token that opens a `SELBTN(...)` / `SELBTN_READY(...)` /
+// `SELBTN_CANCEL(...)` call. Looks up the keyword first, then reads
+// backwards for an optional `<var>=` prefix, rather than combining both into
+// one regex -- keeps things linear instead of stacking an optional group of
+// quantifiers in front of an alternation.
+const SELBTN_KEYWORD_RE = /(SELBTN_READY|SELBTN_CANCEL|SELBTN)\(/;
+
+function matchAssignedVar(trimmed, beforeIndex) {
+  const eq = trimmed.lastIndexOf("=", beforeIndex);
+  if (eq === -1) return undefined;
+  const varName = trimmed.slice(0, eq).trim();
+  return varName || undefined;
+}
+
+function matchSelbtnOpen(trimmed) {
+  const m = SELBTN_KEYWORD_RE.exec(trimmed);
+  if (!m) return null;
+  return { keyword: m[1], varName: matchAssignedVar(trimmed, m.index) };
+}
+
+// `SELBTN_READY` doesn't assign a variable itself -- that happens later via a
+// separate `<var>=SELBTN_START` line once the buttons are actually shown.
+function matchSelbtnStart(trimmed) {
+  const idx = trimmed.indexOf("SELBTN_START");
+  if (idx === -1) return undefined;
+  const after = trimmed.slice(idx + "SELBTN_START".length);
+  if (/^\w/.test(after)) return undefined; // e.g. a longer identifier, not this token
+  return matchAssignedVar(trimmed, idx);
+}
+
+// How far past a SELBTN(...) block's closing paren to search for its
+// `IF(<var>==n){`/`ELSEIF(<var>==n){` branches. Bounded so that, on the rare
+// file where a block's result isn't checked nearby (e.g. a custom event
+// widget), we fail to find a jump target rather than latching onto some
+// unrelated later reuse of the same variable name.
+const CHOICE_JUMP_LOOKAHEAD = 150;
+
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
+}
+
+// Running net paren delta for a line, ignoring parens inside quoted text (so
+// a stray "(" in dialogue can't confuse SELBTN block-boundary tracking).
+function unquotedParenDelta(line) {
+  let delta = 0;
+  let inQuote = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (inQuote && c === "\\") {
+      i++;
+      continue;
+    }
+    if (c === '"') {
+      inQuote = !inQuote;
+      continue;
+    }
+    if (inQuote) continue;
+    if (c === "(") delta++;
+    else if (c === ")") delta--;
+  }
+  return delta;
+}
+
+// Finds the first quoted segment on a line -- a choice's button text, e.g.
+// `"Invite Yoshino",` or (with extra trailing args) `"Don't help"@some_flag`
+// or (closing its SELBTN call on the same line) `"It's too dangerous")`.
+// Returns the span's start (the opening quote) and end (just past the
+// closing quote) so callers can preserve everything outside it verbatim,
+// or null if the line has no quoted segment at all.
+function matchQuotedSpan(line) {
+  const start = line.indexOf('"');
+  if (start === -1) return null;
+  let i = start + 1;
+  while (i < line.length) {
+    if (line[i] === "\\") {
+      i += 2;
+      continue;
+    }
+    if (line[i] === '"') return { start, end: i + 1 };
+    i++;
+  }
+  return null;
+}
+
+// A choice's button-text line always starts with its quoted segment (see
+// the samples above); this rules out the block's other lines (a bare `)`,
+// a leading numeric/lc0 style arg, ...).
+function isChoiceCandidateLine(trimmed) {
+  return trimmed.startsWith('"') && matchQuotedSpan(trimmed) !== null;
+}
+
+// Scans forward from a SELBTN block's closing paren for its
+// `IF(<var>==n){`/`ELSEIF(<var>==n){` branches, returning a Map from choice
+// index to the line number of the first translatable line inside that
+// branch (the "start message" a jump link should land on).
+function findChoiceJumpTargets(lines, afterLine, varName, choiceCount) {
+  const targets = new Map();
+  const ifRe = new RegExp(String.raw`^(?:IF|ELSEIF)\(${escapeRegExp(varName)}==(\d+)\)\{`);
+  const limit = Math.min(lines.length, afterLine + CHOICE_JUMP_LOOKAHEAD);
+  for (let k = afterLine; k < limit && targets.size < choiceCount; k++) {
+    const m = ifRe.exec(lines[k].trim());
+    if (!m || targets.has(Number(m[1]))) continue;
+    let t = k + 1;
+    while (t < lines.length && !isTextLine(lines[t])) t++;
+    if (t < lines.length) targets.set(Number(m[1]), t + 1);
+  }
+  return targets;
+}
+
+// Finds every SELBTN(...)/SELBTN_READY(...)/SELBTN_CANCEL(...) choice block in
+// a script file's lines and returns a Map from 1-based line number (of each
+// choice's button-text line) to its 0-based position within the block and,
+// best-effort, the line number where picking that choice starts playing out.
+function findChoiceLines(lines) {
+  const result = new Map();
+
+  let i = 0;
+  while (i < lines.length) {
+    const trimmed = lines[i].trim();
+    const open = (trimmed.startsWith(";") || trimmed.startsWith("//")) ? null : matchSelbtnOpen(trimmed);
+    if (!open) {
+      i++;
+      continue;
+    }
+
+    let varName = open.varName;
+    const isReady = open.keyword === "SELBTN_READY";
+
+    let depth = unquotedParenDelta(trimmed);
+    const choiceLines = [];
+    let j = i;
+    while (depth > 0 && j + 1 < lines.length) {
+      j++;
+      const lineTrimmed = lines[j].trim();
+      if (isChoiceCandidateLine(lineTrimmed)) choiceLines.push(j + 1);
+      depth += unquotedParenDelta(lineTrimmed);
+    }
+
+    if (isReady && choiceLines.length > 0) {
+      varName = undefined;
+      const limit = Math.min(lines.length, j + CHOICE_JUMP_LOOKAHEAD);
+      for (let k = j + 1; k < limit; k++) {
+        const started = matchSelbtnStart(lines[k].trim());
+        if (started) {
+          varName = started;
+          break;
+        }
+      }
+    }
+
+    const targets = varName ? findChoiceJumpTargets(lines, j + 1, varName, choiceLines.length) : new Map();
+    choiceLines.forEach((lineNum, idx) => {
+      result.set(lineNum, { index: idx, jumpToLine: targets.get(idx) });
+    });
+
+    i = j + 1;
+  }
+
+  return result;
+}
+
+// Rebuilds a choice's button-text line for the patch file: preserves
+// everything outside the quoted text verbatim (indentation, trailing comma,
+// `@directive`, extra args, a same-line closing paren, ...), swapping only
+// the quoted text itself.
+function buildChoiceLine(originalRawLine, newText) {
+  const span = matchQuotedSpan(originalRawLine);
+  const prefix = span ? originalRawLine.slice(0, span.start) : originalRawLine;
+  const suffix = span ? originalRawLine.slice(span.end) : "";
+  return `${prefix}"${escapeQuoted(newText)}"${suffix}`;
 }
 
 function listSsFiles() {
@@ -208,9 +399,11 @@ function apiError(status, message) {
   return Object.assign(new Error(message), { status });
 }
 
-// Validates a (file, line) pair from an /api/translation request and
-// returns the original raw script line it refers to, so callers don't have
-// to re-derive the same checks loadSsRows already performs at render time.
+// Validates a (file, line) pair from an /api/translation request and returns
+// the original raw script line it refers to plus whether it's a SELBTN
+// choice line (which patches back differently than a `"R` dialogue line), so
+// callers don't have to re-derive the same checks loadSsRows already
+// performs at render time.
 function validateSsLine(file, line) {
   if (typeof file !== "string" || !listSsFiles().includes(file)) {
     throw apiError(400, "Unknown script file");
@@ -220,10 +413,10 @@ function validateSsLine(file, line) {
   }
   const lines = readLines(path.join(ORIGINAL_DIR, file));
   const raw = lines[line - 1];
-  if (raw === undefined || !isTextLine(raw)) {
-    throw apiError(400, "Line is not a translatable text line");
-  }
-  return raw;
+  if (raw === undefined) throw apiError(400, "Line is not a translatable text line");
+  if (isTextLine(raw)) return { raw, isChoice: false };
+  if (findChoiceLines(lines).has(line)) return { raw, isChoice: true };
+  throw apiError(400, "Line is not a translatable text line");
 }
 
 // Validates a gameexe.ini line number from an /api/speaker-name request and
@@ -244,16 +437,38 @@ function loadSsRows(ssFile) {
   const lines = readLines(originalPath);
   const patch = loadPatchMap(path.join(PATCH_DIR, `${ssFile}.patch`));
   const speakerNamesTH = loadSpeakerNamesTH(SPEAKER_LINES);
+  const choiceLines = findChoiceLines(lines);
 
   const rows = [];
   lines.forEach((text, i) => {
-    if (!isTextLine(text)) return;
     const line = i + 1;
+    const choice = choiceLines.get(line);
+    const isNormalText = isTextLine(text);
+    if (!isNormalText && !choice) return;
+
     const after = patch.get(line) ?? "";
     const translated = patch.has(line);
+
+    if (choice) {
+      rows.push({
+        line,
+        type: "choice",
+        choiceIndex: choice.index,
+        jumpToLine: choice.jumpToLine,
+        speaker: "",
+        speakerTH: "",
+        speakerNamaeLine: undefined,
+        before: extractSpeakerAndText(text, speakerNamesTH).text,
+        after: translated ? extractSpeakerAndText(after, speakerNamesTH).text : "",
+        translated,
+      });
+      return;
+    }
+
     const { speakerKey, speaker, speakerTH, text: beforeText } = extractSpeakerAndText(text, speakerNamesTH);
     rows.push({
       line,
+      type: "text",
       speaker,
       speakerTH,
       speakerNamaeLine: speakerKey ? SPEAKER_LINES.get(speakerKey) : undefined,
@@ -324,6 +539,11 @@ const PAGE_STYLE = `
   .btn-delete { background: #b3261e; color: #fff; border-color: #b3261e; }
   .btn-delete:disabled, .edit-actions button:disabled { opacity: 0.5; cursor: not-allowed; }
   .edit-status { font-size: 0.8rem; color: #b45309; }
+  tr.choice td { background: #eef4fb; }
+  tr.choice:nth-child(even) td { background: #e6eff9; }
+  td.choice-badge { color: #0b5fa5; }
+  a.jump-link { text-decoration: none; }
+  tr:target td { outline: 2px solid #0b5fa5; outline-offset: -2px; }
 `;
 
 const FILTER_SCRIPT = `
@@ -616,10 +836,21 @@ function renderSpeakerThCell(r, editable) {
   return `<td class="speaker-th editable" data-line="${r.speakerNamaeLine}" data-raw="${escapeHtml(r.speakerTH)}">${content}</td>`;
 }
 
+// Choice rows (SELBTN button text) show a "Choice N" badge instead of a
+// speaker name, plus a jump link to the first line of the branch that choice
+// leads to, when one could be located (see findChoiceLines).
+function renderSpeakerCell(r) {
+  if (r.type !== "choice") return `<td class="speaker">${escapeHtml(r.speaker)}</td>`;
+  const jump =
+    r.jumpToLine != null ? ` <a class="jump-link" href="#line-${r.jumpToLine}" title="Jump to start of this choice">&#8618;</a>` : "";
+  return `<td class="speaker choice-badge">Choice ${r.choiceIndex + 1}${jump}</td>`;
+}
+
 function renderRow(r, editable) {
-  return `<tr class="${r.translated ? "translated" : "pending"}">
+  const rowClasses = [r.translated ? "translated" : "pending", r.type === "choice" ? "choice" : ""].filter(Boolean).join(" ");
+  return `<tr id="line-${r.line}" class="${rowClasses}">
   <td class="line">${r.line}</td>
-  <td class="speaker">${escapeHtml(r.speaker)}</td>
+  ${renderSpeakerCell(r)}
   ${renderSpeakerThCell(r, editable)}
   <td class="before">${escapeHtml(r.before)}</td>
   <td class="after${editable ? " editable" : ""}"${editable ? ` data-line="${r.line}" data-raw="${escapeHtml(r.after)}"` : ""}>${r.translated ? escapeHtml(r.after) : '<span class="placeholder">(untranslated)</span>'}</td>
@@ -725,7 +956,7 @@ function serveFile(res, name) {
 async function handleTranslationApi(req, res) {
   const body = await readJsonBody(req);
   const { file, line } = body;
-  const raw = validateSsLine(file, line);
+  const { raw, isChoice } = validateSsLine(file, line);
   const patchPath = path.join(PATCH_DIR, `${file}.patch`);
   const map = loadPatchMap(patchPath);
 
@@ -740,7 +971,7 @@ async function handleTranslationApi(req, res) {
   if (typeof body.text !== "string" || !body.text.trim()) {
     throw apiError(400, "Text is required");
   }
-  const content = buildPatchLine(raw, body.text);
+  const content = isChoice ? buildChoiceLine(raw, body.text) : buildPatchLine(raw, body.text);
   map.set(line, content);
   writePatchMap(patchPath, map);
   res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
